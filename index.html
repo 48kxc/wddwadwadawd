@@ -1,0 +1,1225 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Search,
+  Hash,
+  Plus,
+  Send,
+  Sun,
+  Moon,
+  Users,
+  MessageSquare,
+  Bot,
+  Sparkles,
+  X,
+  Settings,
+  ShieldCheck,
+  Compass,
+  Reply,
+  ChevronRight,
+} from "lucide-react";
+
+/**
+ * AICORD — single-user, Discord-style AI sandbox
+ * ------------------------------------------------
+ * - Everything (servers, channels, users, messages) is procedurally generated.
+ * - No backend, no auth, no real people. Just you and bots.
+ * - Features:
+ *    • Servers + channels, DM drawer
+ *    • Server discovery (join/leave/open)
+ *    • Profiles (click avatars/members)
+ *    • User settings (name, status, bio, theme)
+ *    • Search (servers/channels/users/messages, Cmd/Ctrl-K)
+ *    • Reactions + “reply” button (cosmetic)
+ */
+
+// ----------------------------- Utilities ----------------------------------
+
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+
+// Lightweight seeded RNG (xorshift32)
+function makeRNG(seed) {
+  let x = seed >>> 0 || 123456789;
+  return function rand() {
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    return (x >>> 0) / 4294967296;
+  };
+}
+
+function pick(rng, arr) {
+  return arr[Math.floor(rng() * arr.length)];
+}
+function chance(rng, p = 0.5) {
+  return rng() < p;
+}
+
+// Silly name & text generators
+const FIRST = [
+  "Nova", "Rex", "Mira", "Orion", "Ada", "Zeph", "Quill", "Echo", "Zara",
+  "Kai", "Lumi", "Rune", "Iris", "Sol", "Nyx", "Vega", "Juno", "Aria",
+  "Atlas", "Rhea", "Bex", "Pax", "Noa", "Rune", "Sage",
+];
+const LAST = [
+  "Skylark", "Kepler", "Hawthorne", "Cobalt", "Faraday", "Quasar", "Sterling",
+  "Starling", "Wilde", "Ash", "Kestrel", "Onyx", "Hearth", "Vale", "North",
+  "Blake", "Rook", "Dune", "Voss", "Solis", "Cade", "Wren",
+];
+const SERVER_TOPICS = [
+  "Neural Brew Co.",
+  "Dream-Synth Lab",
+  "Pixel Parlor",
+  "Prompt Garden",
+  "Logic Loom",
+  "Circuit Circus",
+  "Vector Valley",
+  "Glyph Guild",
+  "Story Forge",
+  "Audio Arcade",
+  "Retro Robotics",
+  "Quantum Café",
+  "Byte Bazaar",
+  "Orbital Orchard",
+  "Shader Sanctuary",
+];
+const CHANNELS = [
+  "general",
+  "prompts",
+  "showcase",
+  "bot-lab",
+  "memes",
+  "music",
+  "off-topic",
+  "ask-anything",
+  "help",
+  "work-in-progress",
+];
+
+const EMOTES = ["✨", "🤖", "🧠", "⚙️", "🎛️", "🎨", "🛰️", "🧩", "🦾", "🧪", "💡", "🧷", "📎"];
+const TOPICS = [
+  "text-generation",
+  "image diffusion",
+  "RLHF",
+  "agents",
+  "tool-use",
+  "embeddings",
+  "vector DBs",
+  "audio LLMs",
+  "synthetic data",
+  "prompt engineering",
+  "safety",
+];
+const OPINIONS = [
+  "hot take: few-shot beats fine-tune here",
+  "today I learned: temperature≠creativity",
+  "long prompts are just configs with lore",
+  "remember: evals before vibes",
+  "I ship everything behind a feature flag",
+  "prefer cosine to dot for retrieval",
+  "stop putting secrets in prompts",
+  "agents aren’t interns, they’re workflows",
+  "small model + good data > huge model + junk",
+];
+
+function sentence(rng) {
+  const who = `${pick(rng, FIRST)} ${pick(rng, LAST)}`;
+  const emo = pick(rng, EMOTES);
+  const t = pick(rng, TOPICS);
+  const op = pick(rng, OPINIONS);
+  const filler = [
+    `spun up a mini-agent for ${t}`,
+    `benching variants; ${op}`,
+    `shipping a demo ${emo}`,
+    `trying to reproduce a paper on ${t}`,
+    `broke prod (again) ${emo}`,
+    `writing a guide on ${t}`,
+    `pairing with a bot on codegen ${emo}`,
+  ];
+  return `${who}: ${pick(rng, filler)}`;
+}
+
+function loremMsg(rng) {
+  const n = 1 + Math.floor(rng() * 3);
+  return Array.from({ length: n }, () => sentence(rng)).join("\n");
+}
+
+function avatar(seedStr) {
+  // Simple deterministic gradient avatar based on a hash
+  let h = 0;
+  for (let i = 0; i < seedStr.length; i++)
+    h = Math.imul(31, h) + seedStr.charCodeAt(i) | 0;
+  const hue = Math.abs(h) % 360;
+  return `linear-gradient(135deg,hsl(${hue} 70% 55%),hsl(${(hue + 60) % 360} 70% 45%))`;
+}
+
+// ----------------------------- World Model ---------------------------------
+
+function makeUser(rng, id) {
+  const name = `${pick(rng, FIRST)} ${pick(rng, LAST)}`;
+  const handle = `@${name.toLowerCase().replace(/[^a-z]/g, "")}${Math.floor(
+    rng() * 999
+  )}`;
+  const bio = `Into ${pick(rng, TOPICS)}, ${pick(
+    rng,
+    TOPICS
+  )}, and ${pick(rng, TOPICS)}. ${pick(rng, OPINIONS)}.`;
+  return { id: `u${id}`, name, handle, bio };
+}
+
+function makeServer(rng, id) {
+  const title = pick(rng, SERVER_TOPICS);
+  const channels = CHANNELS.map((c, i) => ({
+    id: `c${id}-${i}`,
+    name: c,
+    topic: pick(rng, TOPICS),
+  }));
+  const members = Array.from(
+    { length: 12 + Math.floor(rng() * 30) },
+    (_, i) => makeUser(rng, `${id}-${i}`)
+  );
+  return { id: `s${id}`, title, channels, members };
+}
+
+function generateWorld(seed = 42) {
+  const rng = makeRNG(seed);
+  const servers = Array.from({ length: 10 }, (_, i) => makeServer(rng, i + 1));
+  const users = Array.from({ length: 40 }, (_, i) => makeUser(rng, i + 100));
+  const dms = users.slice(0, 18).map((u, i) => ({
+    id: `d${i}`,
+    peer: u,
+    messages: Array.from(
+      { length: 8 + Math.floor(rng() * 8) },
+      () => ({
+        id: crypto.randomUUID(),
+        from: u,
+        text: loremMsg(rng),
+        ts: Date.now() - Math.floor(rng() * 1e8),
+      })
+    ),
+  }));
+  return { seed, servers, users, dms };
+}
+
+// ----------------------------- Search --------------------------------------
+
+function fuseLikeScore(q, text) {
+  if (!q) return 0;
+  const nq = q.trim().toLowerCase();
+  const nt = text.toLowerCase();
+  if (nt.includes(nq)) return 100 + nq.length;
+  // token overlap
+  const qTokens = new Set(nq.split(/\s+/));
+  const tTokens = new Set(nt.split(/\s+/));
+  let overlap = 0;
+  qTokens.forEach((t) => {
+    if (t && tTokens.has(t)) overlap++;
+  });
+  return overlap * 10;
+}
+
+function searchWorld(world, q) {
+  if (!q) return { servers: [], channels: [], users: [], messages: [] };
+
+  const servers = world.servers
+    .map((s) => ({
+      item: s,
+      score: Math.max(
+        fuseLikeScore(q, s.title),
+        s.channels.reduce(
+          (m, ch) => Math.max(m, fuseLikeScore(q, ch.name + " " + ch.topic)),
+          0
+        )
+      ),
+    }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 7);
+
+  const channels = world.servers
+    .flatMap((s) =>
+      s.channels.map((ch) => ({
+        item: { ...ch, serverId: s.id, serverTitle: s.title },
+        score: fuseLikeScore(q, `${ch.name} ${ch.topic} ${s.title}`),
+      }))
+    )
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+
+  const users = [...world.users, ...world.servers.flatMap((s) => s.members)]
+    .map((u) => ({
+      item: u,
+      score: Math.max(
+        fuseLikeScore(q, u.name),
+        fuseLikeScore(q, u.handle),
+        fuseLikeScore(q, u.bio)
+      ),
+    }))
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+
+  const rng = makeRNG(world.seed + 999);
+  const messages = Array.from({ length: 60 }, () => ({
+    id: crypto.randomUUID(),
+    from: pick(rng, world.users),
+    text: loremMsg(rng),
+    location: chance(rng, 0.6)
+      ? {
+          type: "channel",
+          serverTitle: pick(rng, world.servers).title,
+          channel: pick(rng, CHANNELS),
+        }
+      : { type: "dm", peer: pick(rng, world.users).name },
+    ts: Date.now() - Math.floor(rng() * 1e9),
+  }))
+    .map((m) => ({
+      item: m,
+      score: fuseLikeScore(
+        q,
+        `${m.from.name} ${m.text} ${
+          m.location.type === "channel"
+            ? m.location.serverTitle + " #" + m.location.channel
+            : m.location.peer
+        }`
+      ),
+    }))
+    .filter((r) => r.score > 40)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 12);
+
+  return { servers, channels, users, messages };
+}
+
+// ----------------------------- UI Bits -------------------------------------
+
+function Badge({ children }) {
+  return (
+    <span className="rounded-md bg-neutral-200 px-1.5 py-0.5 text-[10px] font-medium text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300">
+      {children}
+    </span>
+  );
+}
+
+function Modal({ open, onClose, children, className = "" }) {
+  if (!open) return null;
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      onMouseDown={onClose}
+    >
+      <div
+        className={
+          "max-h-[90vh] w-full max-w-3xl overflow-hidden rounded-2xl border border-neutral-700/50 bg-neutral-950 text-neutral-100 shadow-2xl " +
+          className
+        }
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="flex justify-end p-2">
+          <button
+            onClick={onClose}
+            className="rounded-lg p-1 hover:bg-neutral-800"
+          >
+            <X className="h-4 w-4 text-neutral-400" />
+          </button>
+        </div>
+        <div className="-mt-3">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function RailButton({ label, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`group relative m-2 flex h-12 w-12 items-center justify-center rounded-2xl transition-all ${
+        active
+          ? "bg-indigo-500 text-white shadow-lg scale-105"
+          : "bg-neutral-200/70 dark:bg-neutral-800 hover:scale-105"
+      }`}
+    >
+      <span className="select-none text-sm font-semibold">
+        {label.slice(0, 2)}
+      </span>
+      <span className="pointer-events-none absolute left-14 top-1/2 -translate-y-1/2 whitespace-nowrap rounded-md bg-black/80 px-2 py-1 text-xs text-white opacity-0 shadow-md transition-opacity group-hover:opacity-100">
+        {label}
+      </span>
+    </button>
+  );
+}
+
+function MemberPill({ user, onOpenProfile }) {
+  return (
+    <button
+      onClick={() => onOpenProfile?.(user)}
+      className="flex w-full items-center gap-2 rounded-xl p-2 text-left hover:bg-neutral-100 dark:hover:bg-neutral-800"
+    >
+      <div
+        className="h-7 w-7 rounded-full"
+        style={{ background: avatar(user.handle) }}
+      />
+      <div className="leading-tight">
+        <div className="text-sm font-medium">{user.name}</div>
+        <div className="text-xs text-neutral-500">{user.handle}</div>
+      </div>
+    </button>
+  );
+}
+
+function ChannelRow({ channel, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-2 rounded-xl px-3 py-2 text-sm transition ${
+        active
+          ? "bg-neutral-200/70 dark:bg-neutral-800"
+          : "hover:bg-neutral-100 dark:hover:bg-neutral-800"
+      }`}
+    >
+      <Hash size={16} />
+      <span className="truncate">{channel.name}</span>
+    </button>
+  );
+}
+
+function MessageBubble({ m, me = false, onReact, onThread, onOpenProfile }) {
+  return (
+    <div
+      className={`group/message flex items-start gap-3 ${
+        me ? "flex-row-reverse text-right" : ""
+      }`}
+    >
+      <button
+        onClick={() => !me && onOpenProfile?.(m.from)}
+        className="h-9 w-9 shrink-0 rounded-full"
+        style={{ background: avatar(m.from?.handle || "me") }}
+      />
+      <div
+        className={`max-w-[60ch] rounded-2xl px-4 py-2 text-sm shadow-sm ${
+          me ? "bg-indigo-600 text-white" : "bg-white dark:bg-neutral-900"
+        }`}
+      >
+        {m.text.split("\n").map((line, i) => (
+          <p
+            key={i}
+            className="mb-1 whitespace-pre-wrap last:mb-0"
+          >
+            {line}
+          </p>
+        ))}
+        <div
+          className={`mt-1 flex items-center gap-2 text-[10px] ${
+            me ? "text-white/80" : "text-neutral-500"
+          }`}
+        >
+          <span>{new Date(m.ts).toLocaleString()}</span>
+          <button
+            onClick={() => onReact?.(m.id)}
+            className="rounded px-1 opacity-0 transition group-hover/message:opacity-100 hover:bg-neutral-800/10"
+          >
+            {me ? "👍" : "✨"}
+          </button>
+          <button
+            onClick={() => onThread?.(m.id)}
+            className="rounded px-1 opacity-0 transition group-hover/message:opacity-100 hover:bg-neutral-800/10"
+          >
+            <Reply className="inline h-3 w-3" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProfileCard({ user }) {
+  if (!user) return null;
+  return (
+    <div className="p-4">
+      <div className="flex items-center gap-3 px-4">
+        <div
+          className="h-14 w-14 rounded-xl"
+          style={{ background: avatar(user.handle) }}
+        />
+        <div>
+          <div className="text-lg font-semibold">{user.name}</div>
+          <div className="text-neutral-400">{user.handle}</div>
+        </div>
+      </div>
+      <div className="mt-3 space-y-2 px-4 pb-4 text-sm">
+        <div>{user.bio}</div>
+        <div className="flex gap-2">
+          <Badge>AI native</Badge>
+          <Badge>Beta</Badge>
+        </div>
+        <div className="flex gap-2">
+          <button className="rounded-lg border border-neutral-700 px-3 py-1 text-xs hover:border-indigo-600">
+            Add Friend
+          </button>
+          <button className="rounded-lg border border-neutral-700 px-3 py-1 text-xs hover:border-indigo-600">
+            Message
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsPanel({
+  meName,
+  setMeName,
+  dark,
+  setDark,
+  bio,
+  setBio,
+  status,
+  setStatus,
+}) {
+  return (
+    <div className="px-6 pb-6">
+      <div className="px-2 text-lg font-semibold">User Settings</div>
+      <div className="mt-3 grid gap-4 px-2 md:grid-cols-2">
+        <div className="space-y-2 rounded-xl border border-neutral-800 p-3">
+          <div className="text-sm font-medium">Profile</div>
+          <label className="text-xs text-neutral-400">Display name</label>
+          <input
+            value={meName}
+            onChange={(e) => setMeName(e.target.value)}
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm outline-none"
+          />
+          <label className="text-xs text-neutral-400">Status</label>
+          <input
+            value={status}
+            onChange={(e) => setStatus(e.target.value)}
+            placeholder="Online, Busy, Lurking…"
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm outline-none"
+          />
+          <label className="text-xs text-neutral-400">Bio</label>
+          <textarea
+            value={bio}
+            onChange={(e) => setBio(e.target.value)}
+            rows={3}
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm outline-none"
+          />
+        </div>
+        <div className="space-y-2 rounded-xl border border-neutral-800 p-3">
+          <div className="text-sm font-medium">Appearance</div>
+          <div className="flex items-center justify-between rounded-lg border border-neutral-800 p-2">
+            <span>Dark mode</span>
+            <button
+              onClick={() => setDark((d) => !d)}
+              className="rounded-lg border border-neutral-700 px-2 py-1 text-xs"
+            >
+              {dark ? "On" : "Off"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Discovery({ servers, joined, onJoinToggle }) {
+  return (
+    <div className="px-6 pb-6">
+      <div className="flex items-center gap-2 px-2">
+        <Compass className="h-4 w-4 text-neutral-400" />
+        <div className="text-lg font-semibold">Discover Servers</div>
+      </div>
+      <div className="mt-3 grid gap-3 px-2 md:grid-cols-2 lg:grid-cols-3">
+        {servers.map((s) => {
+          const isJoined = joined.has(s.id);
+          return (
+            <div
+              key={s.id}
+              className="rounded-xl border border-neutral-800 p-3"
+            >
+              <div className="mb-1 text-sm font-semibold">{s.title}</div>
+              <div className="mb-2 text-xs text-neutral-400">
+                {s.channels.length} channels · {s.members.length} members
+              </div>
+              <div className="flex flex-wrap gap-1 text-[10px] text-neutral-400">
+                {s.channels.slice(0, 4).map((ch) => (
+                  <Badge key={ch.id}>#{ch.name}</Badge>
+                ))}
+              </div>
+              <div className="mt-3 flex items-center justify-between">
+                <button
+                  onClick={() => onJoinToggle(s.id, false)}
+                  className={`rounded-lg border px-2 py-1 text-xs ${
+                    isJoined
+                      ? "border-neutral-700 hover:border-rose-500"
+                      : "border-indigo-700 text-indigo-300 hover:border-indigo-500"
+                  }`}
+                >
+                  {isJoined ? "Leave" : "Join"}
+                </button>
+                <button
+                  onClick={() => onJoinToggle(s.id, true)}
+                  className="rounded-lg border border-neutral-700 px-2 py-1 text-xs hover:border-indigo-500"
+                >
+                  Open
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Section({ title, items, render }) {
+  return (
+    <div className="space-y-2 p-3">
+      <div className="text-xs uppercase tracking-wide text-neutral-400">
+        {title}
+      </div>
+      {items.length === 0 && (
+        <div className="text-xs text-neutral-500">No matches</div>
+      )}
+      <div className="space-y-2">
+        {items.map((r, i) => (
+          <div key={i}>{render(r)}</div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Composer({ onSend, meName, setMeName }) {
+  const [val, setVal] = useState("");
+  const ref = useRef(null);
+  return (
+    <div className="border-t border-neutral-200/70 bg-white/80 p-3 backdrop-blur dark:border-neutral-800 dark:bg-neutral-900/60">
+      <div className="mx-auto flex max-w-3xl items-end gap-2">
+        <div className="hidden shrink-0 items-center gap-2 rounded-xl border border-neutral-300 bg-white px-2 py-1 text-xs dark:border-neutral-700 dark:bg-neutral-900 md:flex">
+          <div
+            className="h-5 w-5 rounded-full"
+            style={{ background: avatar("me") }}
+          />
+          <input
+            value={meName}
+            onChange={(e) => setMeName(e.target.value)}
+            className="w-28 bg-transparent outline-none"
+          />
+        </div>
+        <textarea
+          ref={ref}
+          value={val}
+          onChange={(e) => setVal(e.target.value)}
+          rows={1}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              onSend(val);
+              setVal("");
+            }
+          }}
+          placeholder="Message #channel"
+          className="min-h-[40px] flex-1 resize-none rounded-xl border border-neutral-300 bg-white/80 px-3 py-2 text-sm shadow-inner outline-none placeholder:text-neutral-400 focus:ring-2 focus:ring-indigo-400 dark:border-neutral-700 dark:bg-neutral-900"
+        />
+        <button
+          onClick={() => {
+            onSend(val);
+            setVal("");
+            ref.current?.focus();
+          }}
+          className="inline-flex items-center gap-1 rounded-xl border border-neutral-300 bg-white px-3 py-2 text-sm font-medium shadow hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+        >
+          <Send className="h-4 w-4" /> Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DMThread({ t, onSend, onOpenProfile }) {
+  const [draft, setDraft] = useState("");
+  return (
+    <details className="group rounded-xl border border-neutral-300 bg-white/60 p-2 open:bg-white dark:border-neutral-700 dark:bg-neutral-900/60 dark:open:bg-neutral-900">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-2 rounded-lg px-1 py-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              onOpenProfile?.(t.peer);
+            }}
+            className="h-7 w-7 rounded-full"
+            style={{ background: avatar(t.peer.handle) }}
+          />
+          <div className="leading-tight">
+            <div className="text-sm font-medium">{t.peer.name}</div>
+            <div className="text-xs text-neutral-500">{t.peer.handle}</div>
+          </div>
+        </div>
+        <ChevronRight className="h-4 w-4 text-neutral-400 transition group-open:rotate-90" />
+      </summary>
+      <div className="mt-2 space-y-2">
+        {t.messages.slice(-8).map((m) => (
+          <MessageBubble key={m.id} m={m} me={false} />
+        ))}
+      </div>
+      <div className="mt-2 flex items-center gap-2">
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              onSend(t.id, draft);
+              setDraft("");
+            }
+          }}
+          placeholder={`Message ${t.peer.name}`}
+          className="flex-1 rounded-lg border border-neutral-300 bg-white px-2 py-1 text-sm outline-none dark:border-neutral-700 dark:bg-neutral-900"
+        />
+        <button
+          onClick={() => {
+            onSend(t.id, draft);
+            setDraft("");
+          }}
+          className="rounded-lg border border-neutral-300 bg-white px-2 py-1 text-xs shadow hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+        >
+          <Send className="h-3 w-3" />
+        </button>
+      </div>
+    </details>
+  );
+}
+
+// ----------------------------- Main App ------------------------------------
+
+export default function AICord() {
+  const PREF_KEY = "aicord.session";
+
+  const [session] = useState(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      return JSON.parse(localStorage.getItem(PREF_KEY) || "null");
+    } catch {
+      return null;
+    }
+  });
+
+  const [seed, setSeed] = useState(session?.seed ?? 42);
+  const world = useMemo(() => generateWorld(seed), [seed]);
+
+  const [meName, setMeName] = useState(session?.meName || "You");
+  const [status, setStatus] = useState(session?.status || "Online");
+  const [bio, setBio] = useState(session?.bio || "human among bots");
+  const me = useMemo(
+    () => ({ id: "me", name: meName, handle: "@you", bio }),
+    [meName, bio]
+  );
+
+  const [joined, setJoined] = useState(
+    () =>
+      new Set(
+        session?.joinedIds || world.servers.slice(0, 4).map((s) => s.id)
+      )
+  );
+
+  const [activeServerId, setActiveServerId] = useState(
+    session?.activeServerId ?? world.servers[0].id
+  );
+  const activeServer =
+    world.servers.find((s) => s.id === activeServerId) || world.servers[0];
+
+  const [activeChannelId, setActiveChannelId] = useState(
+    session?.activeChannelId ?? activeServer.channels[0].id
+  );
+  const activeChannel =
+    activeServer.channels.find((c) => c.id === activeChannelId) ||
+    activeServer.channels[0];
+
+  const [dark, setDark] = useState(session?.dark ?? true);
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", dark);
+  }, [dark]);
+
+  // Persist session
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const s = {
+      seed,
+      activeServerId,
+      activeChannelId,
+      meName,
+      dark,
+      status,
+      bio,
+      joinedIds: [...joined],
+    };
+    localStorage.setItem(PREF_KEY, JSON.stringify(s));
+  }, [
+    seed,
+    activeServerId,
+    activeChannelId,
+    meName,
+    dark,
+    status,
+    bio,
+    joined,
+  ]);
+
+  // Chat state
+  const rng = useMemo(
+    () => makeRNG(seed * 1337 + activeChannelId.length),
+    [seed, activeChannelId]
+  );
+  const [msgs, setMsgs] = useState(() =>
+    Array.from({ length: 15 }, () => ({
+      id: crypto.randomUUID(),
+      from: pick(rng, activeServer.members),
+      text: loremMsg(rng),
+      ts: Date.now() - Math.floor(Math.random() * 1e8),
+    }))
+  );
+  useEffect(() => {
+    setMsgs(
+      Array.from({ length: 15 }, () => ({
+        id: crypto.randomUUID(),
+        from: pick(rng, activeServer.members),
+        text: loremMsg(rng),
+        ts: Date.now() - Math.floor(Math.random() * 1e8),
+      }))
+    );
+  }, [activeServerId, activeChannelId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const listRef = useRef(null);
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+  }, [msgs]);
+
+  function send(text) {
+    if (!text.trim()) return;
+    const now = Date.now();
+    const myMsg = { id: crypto.randomUUID(), from: me, text, ts: now };
+    setMsgs((m) => [...m, myMsg]);
+    // AI replies (1–3 messages)
+    const replies = 1 + Math.floor(Math.random() * 3);
+    const delay = 300 + Math.floor(Math.random() * 500);
+    for (let i = 0; i < replies; i++) {
+      setTimeout(() => {
+        const bot = pick(rng, activeServer.members);
+        const reply = {
+          id: crypto.randomUUID(),
+          from: bot,
+          text: loremMsg(rng),
+          ts: Date.now(),
+        };
+        setMsgs((m) => [...m, reply]);
+      }, delay * (i + 1));
+    }
+  }
+
+  function reactToMessage() {
+    // purely cosmetic hook; you could track reactions here if you want
+  }
+  function openThread() {
+    // placeholder for thread UI
+  }
+
+  // DMs
+  const [dmOpen, setDmOpen] = useState(false);
+  const [dmThreads, setDmThreads] = useState(() => world.dms);
+  function sendDM(threadId, text) {
+    if (!text.trim()) return;
+    setDmThreads((ts) =>
+      ts.map((t) =>
+        t.id === threadId
+          ? {
+              ...t,
+              messages: [
+                ...t.messages,
+                { id: crypto.randomUUID(), from: me, text, ts: Date.now() },
+                {
+                  id: crypto.randomUUID(),
+                  from: t.peer,
+                  text: loremMsg(makeRNG(seed + threadId.length)),
+                  ts: Date.now() + 200,
+                },
+              ],
+            }
+          : t
+      )
+    );
+  }
+
+  // Discovery / Settings / Profiles
+  function joinToggle(id, open = false) {
+    setJoined((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      if (open) setActiveServerId(id);
+      return n;
+    });
+  }
+
+  const [showSearch, setShowSearch] = useState(false);
+  const [showDiscovery, setShowDiscovery] = useState(false);
+  const [openSettings, setOpenSettings] = useState(false);
+  const [profileUser, setProfileUser] = useState(null);
+
+  // Global search (Ctrl/Cmd-K)
+  const [q, setQ] = useState("");
+  const results = useMemo(() => searchWorld({ ...world }, q), [world, q]);
+  useEffect(() => {
+    function onKey(e) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setShowSearch((v) => !v);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Theme init
+  useEffect(() => {
+    document.documentElement.classList.add("dark");
+  }, []);
+
+  return (
+    <div className="h-screen w-full overflow-hidden bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
+      {/* Top bar */}
+      <div className="flex items-center justify-between border-b border-neutral-200/70 px-3 py-2 dark:border-neutral-800">
+        <div className="flex items-center gap-2">
+          <Bot className="h-5 w-5" />
+          <span className="font-semibold">AIcord</span>
+          <span className="ml-2 rounded-full bg-indigo-600/10 px-2 py-0.5 text-xs text-indigo-600 dark:text-indigo-400">
+            all AI, just you
+          </span>
+          <span className="ml-2 hidden text-xs text-neutral-500 sm:inline">
+            {status}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowSearch(true)}
+            className="rounded-xl border border-neutral-300 bg-white px-2 py-1 text-sm shadow hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+          >
+            <Search className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => setShowDiscovery(true)}
+            className="rounded-xl border border-neutral-300 bg-white px-2 py-1 text-sm shadow hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+          >
+            <Compass className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => setOpenSettings(true)}
+            className="rounded-xl border border-neutral-300 bg-white px-2 py-1 text-sm shadow hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+          >
+            <Settings className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => setDark((d) => !d)}
+            className="rounded-xl border border-neutral-300 bg-white px-2 py-1 text-sm shadow hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+          >
+            {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+          </button>
+          <button
+            onClick={() => setSeed(Math.floor(Math.random() * 1e9))}
+            className="inline-flex items-center gap-1 rounded-xl border border-indigo-300 bg-indigo-50 px-3 py-1 text-xs font-medium text-indigo-700 shadow-sm hover:bg-indigo-100 dark:border-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-300 dark:hover:bg-indigo-900/60"
+          >
+            <Sparkles className="h-4 w-4" />
+            Regenerate world
+          </button>
+        </div>
+      </div>
+
+      <div className="flex h-[calc(100vh-44px)]">
+        {/* Left rail: joined servers */}
+        <div className="flex w-[72px] shrink-0 flex-col items-center overflow-y-auto border-r border-neutral-200/70 py-2 dark:border-neutral-800">
+          {world.servers
+            .filter((s) => joined.has(s.id))
+            .map((s) => (
+              <RailButton
+                key={s.id}
+                label={s.title}
+                active={s.id === activeServerId}
+                onClick={() => {
+                  setActiveServerId(s.id);
+                  setActiveChannelId(s.channels[0].id);
+                }}
+              />
+            ))}
+          <button
+            onClick={() => setShowDiscovery(true)}
+            className="m-2 flex h-12 w-12 items-center justify-center rounded-2xl bg-neutral-200/70 transition hover:scale-105 dark:bg-neutral-800"
+          >
+            <Plus className="h-5 w-5" />
+          </button>
+          <div className="mt-auto p-2 text-center text-[10px] text-neutral-500">
+            <div className="mx-auto mb-1 flex h-8 w-8 items-center justify-center rounded-xl bg-neutral-200 dark:bg-neutral-800">
+              <ShieldCheck className="h-4 w-4" />
+            </div>
+            AI bots
+          </div>
+        </div>
+
+        {/* Channel list */}
+        <div className="flex w-64 shrink-0 flex-col border-r border-neutral-200/70 dark:border-neutral-800">
+          <div className="flex items-center justify-between px-3 py-2">
+            <div className="truncate font-semibold">{activeServer.title}</div>
+          </div>
+          <div className="px-2">
+            {activeServer.channels.map((ch) => (
+              <ChannelRow
+                key={ch.id}
+                channel={ch}
+                active={ch.id === activeChannelId}
+                onClick={() => setActiveChannelId(ch.id)}
+              />
+            ))}
+          </div>
+          <div className="mt-auto p-3 text-xs text-neutral-500">
+            Topic:{" "}
+            <span className="text-neutral-700 dark:text-neutral-300">
+              #{activeChannel.name}
+            </span>{" "}
+            · {activeChannel.topic}
+          </div>
+        </div>
+
+        {/* Chat */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex items-center justify-between border-b border-neutral-200/70 px-4 py-2 dark:border-neutral-800">
+            <div className="flex items-center gap-2">
+              <Hash size={16} />
+              <b className="truncate">{activeChannel.name}</b>
+              <span className="text-xs text-neutral-500">
+                {activeServer.title}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setDmOpen((o) => !o)}
+                className="rounded-lg px-2 py-1 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              >
+                <MessageSquare className="mr-1 inline h-4 w-4" />
+                DMs
+              </button>
+            </div>
+          </div>
+
+          <div
+            ref={listRef}
+            className="flex-1 space-y-3 overflow-y-auto bg-neutral-100/60 p-4 dark:bg-neutral-900/40"
+          >
+            {msgs.map((m) => (
+              <MessageBubble
+                key={m.id}
+                m={m}
+                me={m.from?.id === "me"}
+                onReact={reactToMessage}
+                onThread={openThread}
+                onOpenProfile={setProfileUser}
+              />
+            ))}
+            <div className="text-center">
+              <button
+                onClick={() =>
+                  setMsgs((m) => [
+                    ...m,
+                    ...Array.from({ length: 10 }, () => ({
+                      id: crypto.randomUUID(),
+                      from: pick(rng, activeServer.members),
+                      text: loremMsg(rng),
+                      ts:
+                        Date.now() -
+                        Math.floor(Math.random() * 1e8),
+                    })),
+                  ])
+                }
+                className="rounded-xl border border-neutral-300 bg-white px-3 py-1 text-xs shadow hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+              >
+                Load more
+              </button>
+            </div>
+          </div>
+
+          <Composer onSend={send} meName={meName} setMeName={setMeName} />
+        </div>
+
+        {/* Members / right rail */}
+        <div className="hidden w-72 shrink-0 flex-col border-l border-neutral-200/70 p-2 dark:border-neutral-800 md:flex">
+          <div className="mb-2 flex items-center justify-between px-1">
+            <div className="text-sm font-semibold">Members</div>
+            <Users className="h-4 w-4 text-neutral-500" />
+          </div>
+          <div className="space-y-1 overflow-y-auto">
+            {activeServer.members.slice(0, 30).map((m) => (
+              <MemberPill
+                key={m.id}
+                user={m}
+                onOpenProfile={setProfileUser}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* DMs Drawer */}
+      {dmOpen && (
+        <div className="fixed bottom-3 right-3 z-30 w-[360px] rounded-2xl border border-neutral-300 bg-white/90 shadow-2xl backdrop-blur dark:border-neutral-700 dark:bg-neutral-900/90">
+          <div className="flex items-center justify-between border-b border-neutral-200/70 px-3 py-2 dark:border-neutral-800">
+            <div className="flex items-center gap-2">
+              <MessageSquare className="h-4 w-4" />
+              <b>Direct Messages</b>
+            </div>
+            <button
+              onClick={() => setDmOpen(false)}
+              className="rounded-lg p-1 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+          <div className="max-h-[50vh] overflow-y-auto p-2">
+            {dmThreads.map((t) => (
+              <DMThread
+                key={t.id}
+                t={t}
+                onSend={sendDM}
+                onOpenProfile={setProfileUser}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Profile Modal */}
+      <Modal
+        open={!!profileUser}
+        onClose={() => setProfileUser(null)}
+      >
+        <ProfileCard user={profileUser} />
+      </Modal>
+
+      {/* Settings Modal */}
+      <Modal
+        open={openSettings}
+        onClose={() => setOpenSettings(false)}
+      >
+        <SettingsPanel
+          meName={meName}
+          setMeName={setMeName}
+          dark={dark}
+          setDark={setDark}
+          bio={bio}
+          setBio={setBio}
+          status={status}
+          setStatus={setStatus}
+        />
+      </Modal>
+
+      {/* Discovery Modal */}
+      <Modal
+        open={showDiscovery}
+        onClose={() => setShowDiscovery(false)}
+      >
+        <Discovery
+          servers={world.servers}
+          joined={joined}
+          onJoinToggle={joinToggle}
+        />
+      </Modal>
+
+      {/* Search Modal */}
+      {showSearch && (
+        <div className="fixed inset-0 z-40 grid place-items-start bg-black/40 p-6 pt-20">
+          <div className="mx-auto w-full max-w-3xl overflow-hidden rounded-2xl border border-neutral-700/40 bg-neutral-950 text-neutral-100 shadow-2xl">
+            <div className="flex items-center gap-2 border-b border-neutral-800 px-4 py-2">
+              <Search className="h-4 w-4 text-neutral-400" />
+              <input
+                autoFocus
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="Search servers, channels, users, messages…"
+                className="w-full bg-transparent py-2 text-sm outline-none placeholder:text-neutral-500"
+              />
+              <button
+                onClick={() => setShowSearch(false)}
+                className="rounded-lg p-1 hover:bg-neutral-800"
+              >
+                <X className="h-4 w-4 text-neutral-400" />
+              </button>
+            </div>
+            <div className="grid max-h-[60vh] grid-cols-1 gap-0 overflow-y-auto md:grid-cols-2">
+              <Section
+                title="Servers"
+                items={results.servers}
+                render={(r) => (
+                  <div className="rounded-xl border border-neutral-800/70 p-3 hover:border-indigo-700/60">
+                    <div className="mb-1 text-sm font-semibold">
+                      {r.item.title}
+                    </div>
+                    <div className="text-xs text-neutral-400">
+                      {r.item.channels.length} channels
+                    </div>
+                  </div>
+                )}
+              />
+              <Section
+                title="Channels"
+                items={results.channels}
+                render={(r) => (
+                  <div className="rounded-xl border border-neutral-800/70 p-3 hover:border-indigo-700/60">
+                    <div className="mb-1 text-sm font-semibold">
+                      #{r.item.name}
+                    </div>
+                    <div className="text-xs text-neutral-400">
+                      {r.item.serverTitle}
+                    </div>
+                  </div>
+                )}
+              />
+              <Section
+                title="Users"
+                items={results.users}
+                render={(r) => (
+                  <button
+                    onClick={() => setProfileUser(r.item)}
+                    className="flex w-full items-center gap-2 rounded-xl border border-neutral-800/70 p-3 text-left hover:border-indigo-700/60"
+                  >
+                    <div
+                      className="h-7 w-7 rounded-full"
+                      style={{ background: avatar(r.item.handle) }}
+                    />
+                    <div>
+                      <div className="text-sm font-semibold">
+                        {r.item.name}
+                      </div>
+                      <div className="text-xs text-neutral-400">
+                        {r.item.handle}
+                      </div>
+                    </div>
+                  </button>
+                )}
+              />
+              <Section
+                title="Messages"
+                items={results.messages}
+                render={(r) => (
+                  <div className="rounded-xl border border-neutral-800/70 p-3 hover:border-indigo-700/60">
+                    <div className="mb-1 line-clamp-2 text-sm">
+                      {r.item.text}
+                    </div>
+                    <div className="text-xs text-neutral-400">
+                      {r.item.location.type === "channel"
+                        ? `${r.item.location.serverTitle} • #${r.item.location.channel}`
+                        : `DM • ${r.item.location.peer}`}
+                    </div>
+                  </div>
+                )}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
